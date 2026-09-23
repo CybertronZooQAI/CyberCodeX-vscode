@@ -1,0 +1,51 @@
+/* CyberCodeX Zinc theme — core CSS overwrite nahi, sirf .cybercodex-* skin.
+   Tokens: #0b0c0e bg, rgba(255,255,255,0.08) border, 12px radius, blur(12px). */
+
+.cybercodex-agent {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	gap: 8px;
+	padding: 10px;
+	background: #0b0c0e;
+	color: #e4e4e7;
+	font-family: "JetBrains Mono", "Geist Mono", monospace;
+}
+
+.cybercodex-log {
+	flex: 1;
+	overflow: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	border-radius: 12px;
+	padding: 10px;
+	background: rgba(255, 255, 255, 0.02);
+	backdrop-filter: blur(12px);
+}
+
+.cybercodex-msg { line-height: 1.5; white-space: pre-wrap; }
+.cybercodex-msg.user { opacity: 0.9; }
+.cybercodex-msg.assistant { border-left: 2px solid rgba(255,255,255,0.15); padding-left: 8px; }
+
+.cybercodex-row { display: flex; gap: 8px; }
+.cybercodex-input {
+	flex: 1;
+	resize: none;
+	border-radius: 12px;
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	background: rgba(255,255,255,0.04);
+	color: inherit;
+	padding: 8px;
+	font: inherit;
+}
+.cybercodex-send {
+	border-radius: 12px;
+	border: 1px solid rgba(255, 255, 255, 0.08);
+	background: rgba(255,255,255,0.06);
+	color: inherit;
+	padding: 0 14px;
+	cursor: pointer;
+}
+.cybercodex-send:hover { background: rgba(255,255,255,0.10); }

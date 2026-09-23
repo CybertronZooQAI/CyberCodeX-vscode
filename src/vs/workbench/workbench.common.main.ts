@@ -389,6 +389,10 @@ import './contrib/update/browser/update.contribution.js';
 import './contrib/surveys/browser/nps.contribution.js';
 import './contrib/surveys/browser/languageSurveys.contribution.js';
 
+// CYBERCODEX-START: isolated AI module (upstream-safe, single import)
+import './contrib/cybercodex/browser/cybercodex.contribution.js';
+// CYBERCODEX-END
+
 // Welcome
 import './contrib/welcomeGettingStarted/browser/gettingStarted.contribution.js';
 import './contrib/welcomeAgentSessions/browser/agentSessionsWelcome.contribution.js';
