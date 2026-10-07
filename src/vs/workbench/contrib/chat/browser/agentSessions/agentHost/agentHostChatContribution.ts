@@ -13,7 +13,7 @@ import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { localize } from '../../../../../../nls.js';
 import { affectsAgentHostProviderPreference, IAgentHostService, protectedResourcesRequireGitHubCopilotSignIn, shouldSurfaceLocalAgentHostProvider, type AgentProvider } from '../../../../../../platform/agentHost/common/agentService.js';
 import { IAgentHostEnablementService } from '../../../../../../platform/agentHost/common/agentHostEnablementService.js';
-import { LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+import { AGENT_HOST_SCHEME, LOCAL_AGENT_HOST_AUTHORITY } from '../../../../../../platform/agentHost/common/agentHostUri.js';
 import { type ProtectedResourceMetadata } from '../../../../../../platform/agentHost/common/state/protocol/state.js';
 import { NotificationType } from '../../../../../../platform/agentHost/common/state/sessionActions.js';
 import { type AgentInfo, type RootState } from '../../../../../../platform/agentHost/common/state/sessionState.js';
@@ -36,8 +36,9 @@ import { Target } from '../../../common/promptSyntax/promptTypes.js';
 import { AgentCustomizationItemProvider } from './agentCustomizationItemProvider.js';
 import { agentHostProviderHasBuiltInGitHubMcpServer, COPILOT_CHAT_GITHUB_MCP_COLLECTION_ID } from './agentHostMcpServerSupport.js';
 import { createCustomizationMcpServerCompatibilityScope } from './agentHostMcpServerSupportScope.js';
+import { AgentHostMcpServerMigrationProvider } from './agentHostMcpServerMigrationProvider.js';
 import { AgentHostDownloadProgress } from './agentHostDownloadProgress.js';
-import { authenticateAgentProtectedResourcesWithToken, authenticateProtectedResources, authenticateProtectedResourcesWithToken, AgentHostAuthenticationRecovery, AgentHostAuthTokenCache, resolveAuthenticationInteractively, revokeAuthenticationForRemovedSessions } from './agentHostAuth.js';
+import { autoAuthenticateMcpServer, authenticateAgentProtectedResourcesWithToken, authenticateProtectedResources, authenticateProtectedResourcesWithToken, AgentHostAuthenticationRecovery, AgentHostAuthTokenCache, resolveAuthenticationInteractively, revokeAuthenticationForRemovedSessions } from './agentHostAuth.js';
 import { AgentHostLanguageModelProvider, agentHostProviderSupportsAutoModel } from './agentHostLanguageModelProvider.js';
 import { AgentHostSessionHandler } from './agentHostSessionHandler.js';
 import { AgentHostPromptCacheNotification } from './agentHostPromptCacheNotification.js';
@@ -209,6 +210,11 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 			return;
 		}
 		const store = new DisposableStore();
+		if (this._agentHostService.registerMcpAuthenticationHandler) {
+			// Chat session URIs have no authority; retain that identity for remembered MCP grants.
+			store.add(this._agentHostService.registerMcpAuthenticationHandler(request =>
+				this._instantiationService.invokeFunction(autoAuthenticateMcpServer, this._agentHostService, { scheme: AGENT_HOST_SCHEME, authority: '' }, request.serverName, request.auth)));
+		}
 		store.add(this._agentHostService.onDidNotification(notification => {
 			if (notification.type !== NotificationType.AuthRequired) {
 				return;
@@ -347,6 +353,9 @@ export class AgentHostContribution extends Disposable implements IWorkbenchContr
 					roots => this._activeClientService.acquireMcpServerSupportScope(sessionType, roots),
 				),
 			} : undefined,
+			mcpServerMigrationProvider: agent.provider === 'copilotcli'
+				? store.add(this._instantiationService.createInstance(AgentHostMcpServerMigrationProvider))
+				: undefined,
 		}));
 
 		// Session handler

@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { RunOnceScheduler } from '../../../../../base/common/async.js';
+import { encodeHex, VSBuffer } from '../../../../../base/common/buffer.js';
 import { Event } from '../../../../../base/common/event.js';
 import { Iterable } from '../../../../../base/common/iterator.js';
 import { ParseError, parse as parseJSONC } from '../../../../../base/common/json.js';
@@ -19,12 +20,13 @@ import { hasKey } from '../../../../../base/common/types.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { ConfigurationTarget, getConfigValueInTarget, IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-import { FileChangesEvent, FileChangeType, IFileService } from '../../../../../platform/files/common/files.js';
+import { FileChangesEvent, FileChangeType, FileOperationResult, IFileService, toFileOperationResult } from '../../../../../platform/files/common/files.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ContextKeyExpr, ContextKeyExpression, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
+import { COPILOT_CLI_AGENT_PROVIDER_ID } from '../../../../../platform/agentHost/common/agent.js';
+import { IAgentHostService } from '../../../../../platform/agentHost/common/agentService.js';
 import { observableConfigValue } from '../../../../../platform/observable/common/platformObservableUtils.js';
-import { IStorageService } from '../../../../../platform/storage/common/storage.js';
 import { IWorkspaceContextService } from '../../../../../platform/workspace/common/workspace.js';
 import { localize } from '../../../../../nls.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
@@ -48,12 +50,13 @@ import { Extensions, IExtensionFeaturesRegistry, IExtensionFeatureTableRenderer,
 import * as extensionsRegistry from '../../../../services/extensions/common/extensionsRegistry.js';
 import { IPathService } from '../../../../services/path/common/pathService.js';
 import { ChatConfiguration } from '../constants.js';
-import { ContributionEnablementState, EnablementModel, IEnablementModel } from '../enablement.js';
+import { IEnablementModel } from '../enablement.js';
 import { AUTOMATION_BLUEPRINT_FILE_SUFFIX, parseAutomationBlueprint } from '../automations/automationBlueprint.js';
 import { HookType } from '../promptSyntax/hookTypes.js';
-import { AgentPluginCollisionEnablementModel, getAgentPluginPolicyId, getCanonicalAgentPluginCollisionGroups, getSortedAgentPlugins, IDiscoveredAgentPlugins, isAgentPluginBlockedByPolicy } from './agentPluginEnablement.js';
+import { AgentPluginCollisionEnablementModel, getAgentPluginPolicyEnablement, getAgentPluginPolicyId, getCanonicalAgentPluginCollisionGroups, getSortedAgentPlugins, IAgentPluginEnablementService, IDiscoveredAgentPlugins, isAgentPluginBlockedByPolicy, isAgentPluginForceEnabledByPolicy } from './agentPluginEnablement.js';
 import { IAgentPluginRepositoryService } from './agentPluginRepositoryService.js';
 import { AgentPluginDiscoveryPriority, agentPluginDiscoveryRegistry, IAgentPlugin, IAgentPluginAutomation, IAgentPluginDiscovery, IAgentPluginHook, IAgentPluginInstruction, IAgentPluginService } from './agentPluginService.js';
+import { IPluginInstallService } from './pluginInstallService.js';
 import { IMarketplacePlugin, IPluginMarketplaceService } from './pluginMarketplaceService.js';
 
 // Re-export shared helpers so existing consumers (including tests) continue to work.
@@ -97,12 +100,10 @@ export class AgentPluginService extends Disposable implements IAgentPluginServic
 	constructor(
 		@IInstantiationService instantiationService: IInstantiationService,
 		@IConfigurationService configurationService: IConfigurationService,
-		@IStorageService storageService: IStorageService,
+		@IAgentPluginEnablementService baseEnablementModel: IAgentPluginEnablementService,
 		@ILogService logService: ILogService,
 	) {
 		super();
-
-		const baseEnablementModel = this._register(new EnablementModel('agentPlugins.enablement', storageService));
 
 		const pluginsEnabled = observableConfigValue(ChatConfiguration.PluginsEnabled, true, configurationService);
 
@@ -121,6 +122,23 @@ export class AgentPluginService extends Disposable implements IAgentPluginServic
 			() => configurationService.inspect<Record<string, boolean>>(ChatConfiguration.EnabledPlugins).policyValue,
 		);
 
+		const policyEnablement = derived(reader => {
+			const discoveredPlugins = readDiscoveredAgentPlugins(discoveries, reader);
+			const policy = enabledPluginsPolicy.read(reader);
+			const result = new Map<string, boolean>();
+			if (discoveredPlugins && policy) {
+				for (const { plugins } of discoveredPlugins) {
+					for (const plugin of plugins) {
+						const policyValue = getAgentPluginPolicyEnablement(plugin, policy);
+						if (policyValue !== undefined) {
+							result.set(plugin.uri.toString(), policyValue);
+						}
+					}
+				}
+			}
+			return result;
+		});
+
 		const collisionGroups = derived(reader => {
 			if (!pluginsEnabled.read(reader)) {
 				return new Map<string, readonly string[]>();
@@ -130,10 +148,14 @@ export class AgentPluginService extends Disposable implements IAgentPluginServic
 				return new Map<string, readonly string[]>();
 			}
 			const policy = enabledPluginsPolicy.read(reader);
-			return getCanonicalAgentPluginCollisionGroups(discoveredPlugins, plugin => isAgentPluginBlockedByPolicy(plugin, policy));
+			return getCanonicalAgentPluginCollisionGroups(
+				discoveredPlugins,
+				plugin => isAgentPluginBlockedByPolicy(plugin, policy),
+				plugin => isAgentPluginForceEnabledByPolicy(plugin, policy),
+			);
 		});
 
-		this.enablementModel = new AgentPluginCollisionEnablementModel(baseEnablementModel, collisionGroups);
+		this.enablementModel = new AgentPluginCollisionEnablementModel(baseEnablementModel, collisionGroups, policyEnablement);
 
 		for (const { discovery } of discoveries) {
 			discovery.start(this.enablementModel);
@@ -150,17 +172,14 @@ export class AgentPluginService extends Disposable implements IAgentPluginServic
 			return getSortedAgentPlugins(discoveredPlugins);
 		});
 
-		// Mark policy-blocked plugins rather than hiding them: a blocked plugin
-		// stays visible (shown as disabled) but its `enablement` is forced to
-		// disabled (see `_toPlugin`), so it is inactive and cannot be re-enabled.
 		this._register(autorun(reader => {
 			const plugins = this.plugins.read(reader);
 			const policy = enabledPluginsPolicy.read(reader);
 			transaction(tx => {
 				for (const plugin of plugins) {
-					const blocked = isAgentPluginBlockedByPolicy(plugin, policy);
-					if (setPolicyBlocked(plugin, blocked, tx) && blocked) {
-						logService.debug(`[AgentPluginService] Plugin '${getAgentPluginPolicyId(plugin) ?? plugin.uri.toString()}' blocked — disabled by ChatEnabledPlugins policy`);
+					const policyValue = getAgentPluginPolicyEnablement(plugin, policy);
+					if (setPolicyEnablement(plugin, policyValue, tx) && policyValue !== undefined) {
+						logService.debug(`[AgentPluginService] Plugin '${getAgentPluginPolicyId(plugin) ?? plugin.uri.toString()}' ${policyValue ? 'enabled' : 'disabled'} by ChatEnabledPlugins policy`);
 					}
 				}
 			});
@@ -186,27 +205,23 @@ function readDiscoveredAgentPlugins(discoveries: readonly IAgentPluginDiscoveryW
 	return result;
 }
 
-/**
- * A discovered plugin. Extends the public {@link IAgentPlugin} with a settable
- * `policyBlocked` observable that the service writes to when enterprise policy
- * blocks the plugin.
- */
+/** A discovered plugin with the settable managed enablement observable owned by this service. */
 interface PluginEntry extends IAgentPlugin {
-	readonly policyBlocked: ISettableObservable<boolean>;
+	readonly policyEnablement: ISettableObservable<boolean | undefined>;
 }
 
 /**
- * Marks a plugin as blocked (or unblocked) by enterprise policy. Safe to call
+ * Sets a plugin's managed enablement decision. Safe to call
  * for any {@link IAgentPlugin}; entries without a settable observable (e.g. test
  * doubles) are ignored.
  */
-function setPolicyBlocked(plugin: IAgentPlugin, blocked: boolean, tx: ITransaction): boolean {
-	const obs = plugin.policyBlocked as ISettableObservable<boolean> | undefined;
+function setPolicyEnablement(plugin: IAgentPlugin, policyValue: boolean | undefined, tx: ITransaction): boolean {
+	const obs = plugin.policyEnablement as ISettableObservable<boolean | undefined> | undefined;
 	if (obs && typeof obs.set === 'function') {
-		if (obs.get() === blocked) {
+		if (obs.get() === policyValue) {
 			return false;
 		}
-		obs.set(blocked, tx);
+		obs.set(policyValue, tx);
 		return true;
 	}
 	return false;
@@ -339,12 +354,9 @@ export abstract class AbstractAgentPluginDiscovery extends Disposable implements
 		}
 
 		const store = new DisposableStore();
-		// Set by the service when enterprise policy blocks this plugin; when set,
-		// the plugin is forced disabled regardless of the user's enablement choice.
-		const policyBlocked = observableValue<boolean>('policyBlocked', false);
-		const enablement = derived(r => policyBlocked.read(r)
-			? ContributionEnablementState.DisabledProfile
-			: this._enablementModel.readEnabled(key, r));
+		const policyEnablement = observableValue<boolean | undefined>('policyEnablement', undefined);
+		const policyBlocked = derived(reader => policyEnablement.read(reader) === false);
+		const enablement = derived(r => this._enablementModel.readEnabled(key, r));
 
 		// Read the manifest up front so its `name` field can be used in the
 		// plugin label (for direct installs that have no marketplace metadata).
@@ -437,6 +449,11 @@ export abstract class AbstractAgentPluginDiscovery extends Disposable implements
 		// was already populated above before constructing the observable.
 		const readManifest = async () => {
 			try {
+				const stat = await this._fileService.resolve(uri);
+				if (!stat.isDirectory) {
+					await this._refreshPlugins();
+					return;
+				}
 				const latestFormat = await detectPluginFormat(uri, this._fileService);
 				if (latestFormat.format !== format.format) {
 					await this._refreshPlugins();
@@ -444,6 +461,10 @@ export abstract class AbstractAgentPluginDiscovery extends Disposable implements
 				}
 				manifest.set(await readPluginManifest(uri, format, this._fileService), undefined);
 			} catch (error) {
+				if (toFileOperationResult(error) === FileOperationResult.FILE_NOT_FOUND) {
+					await this._refreshPlugins();
+					return;
+				}
 				manifest.set(undefined, undefined);
 				this._logService.warn(`[AgentPluginDiscovery] Rejected updated plugin '${uri.toString()}': ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -480,6 +501,7 @@ export abstract class AbstractAgentPluginDiscovery extends Disposable implements
 			label: fromMarketplace?.name ?? manifestName ?? basename(uri),
 			version: pluginVersion,
 			enablement,
+			policyEnablement,
 			policyBlocked,
 			remove: removeCallback,
 			hooks,
@@ -764,6 +786,7 @@ export class MarketplaceAgentPluginDiscovery extends AbstractAgentPluginDiscover
 
 	constructor(
 		@IPluginMarketplaceService private readonly _pluginMarketplaceService: IPluginMarketplaceService,
+		@IPluginInstallService private readonly _pluginInstallService: IPluginInstallService,
 		@IAgentPluginRepositoryService private readonly _pluginRepositoryService: IAgentPluginRepositoryService,
 		@IFileService fileService: IFileService,
 		@IPathService pathService: IPathService,
@@ -777,7 +800,21 @@ export class MarketplaceAgentPluginDiscovery extends AbstractAgentPluginDiscover
 		this._enablementModel = enablementModel;
 		const scheduler = this._register(new RunOnceScheduler(() => this._refreshPlugins(), 0));
 		this._register(autorun(reader => {
-			this._pluginMarketplaceService.installedPlugins.read(reader);
+			const installed = this._pluginMarketplaceService.installedPlugins.read(reader);
+			const watchedParents: URI[] = [];
+			for (const entry of installed) {
+				const parent = dirname(entry.pluginUri);
+				if (watchedParents.some(candidate => isEqual(candidate, parent))) {
+					continue;
+				}
+				watchedParents.push(parent);
+				const watcher = reader.store.add(this._fileService.createWatcher(parent, { recursive: false, excludes: [] }));
+				reader.store.add(watcher.onDidChange(change => {
+					if (installed.some(candidate => isEqual(dirname(candidate.pluginUri), parent) && change.affects(candidate.pluginUri))) {
+						scheduler.schedule();
+					}
+				}));
+			}
 			scheduler.schedule();
 		}));
 		scheduler.schedule();
@@ -809,18 +846,7 @@ export class MarketplaceAgentPluginDiscovery extends AbstractAgentPluginDiscover
 				repositoryUri,
 				remove: async () => {
 					this._enablementModel.remove(stat.resource.toString());
-					this._pluginMarketplaceService.removeInstalledPlugin(entry.pluginUri);
-
-					// Pass remaining installed descriptors so the repository service
-					// can skip deletion when other plugins share the same cache dir.
-					const remaining = this._pluginMarketplaceService.installedPlugins.get();
-					this._pluginRepositoryService.cleanupPluginSource(
-						entry.plugin,
-						remaining.map(e => e.plugin.sourceDescriptor),
-					).catch(error => {
-						this._logService.error('[MarketplaceAgentPluginDiscovery] Failed to clean up plugin source', error);
-					});
-					return true;
+					return this._pluginInstallService.uninstallPlugin(entry.pluginUri);
 				},
 			});
 		}
@@ -847,7 +873,46 @@ interface ICopilotCliInstalledPlugin {
 	readonly uri: URI;
 	readonly name: string;
 	readonly marketplace: string;
+	readonly directSourceId?: string;
 	readonly revision: string;
+}
+
+/** Mirrors the Copilot runtime's canonical direct-source identity contract. */
+async function getCopilotCliDirectSourceId(source: unknown): Promise<string | undefined> {
+	const normalized = typeof source === 'string'
+		? { source: 'github', repo: source }
+		: source && typeof source === 'object' && !Array.isArray(source)
+			? source
+			: undefined;
+	if (!normalized) {
+		return undefined;
+	}
+
+	const field = (name: string): string => {
+		const value = Reflect.get(normalized, name);
+		return typeof value === 'string' ? value : '';
+	};
+	const kind = field('source');
+	let canonical: string;
+	if (kind === 'github' || kind === 'url') {
+		const descriptor: Record<string, string> = {
+			source: kind,
+			[kind === 'github' ? 'repo' : 'url']: field(kind === 'github' ? 'repo' : 'url'),
+			ref: field('ref'),
+		};
+		if (typeof Reflect.get(normalized, 'sha') === 'string') {
+			descriptor.sha = field('sha');
+		}
+		descriptor.path = field('path');
+		canonical = JSON.stringify(descriptor);
+	} else if (kind === 'local') {
+		canonical = JSON.stringify({ source: kind, path: field('path') });
+	} else {
+		return undefined;
+	}
+
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+	return encodeHex(VSBuffer.wrap(new Uint8Array(digest)));
 }
 
 class CopilotCliInstalledPluginsStore extends Disposable {
@@ -994,10 +1059,12 @@ class CopilotCliInstalledPluginsStore extends Disposable {
 				continue;
 			}
 			seen.add(key);
+			const directSourceId = marketplace ? undefined : await getCopilotCliDirectSourceId(Reflect.get(entry, 'source'));
 			result.push({
 				uri,
 				name,
 				marketplace,
+				directSourceId,
 				revision: JSON.stringify({
 					version: Reflect.get(entry, 'version'),
 					installedAt: Reflect.get(entry, 'installed_at'),
@@ -1039,6 +1106,7 @@ function equalsCopilotCliInstalledPlugins(first: readonly ICopilotCliInstalledPl
 			plugin.uri.toString() === second[index].uri.toString()
 			&& plugin.name === second[index].name
 			&& plugin.marketplace === second[index].marketplace
+			&& plugin.directSourceId === second[index].directSourceId
 			&& plugin.revision === second[index].revision
 		);
 }
@@ -1055,6 +1123,7 @@ export class CopilotCliAgentPluginDiscovery extends AbstractAgentPluginDiscovery
 		@IPathService pathService: IPathService,
 		@ILogService logService: ILogService,
 		@IWorkspaceContextService workspaceContextService: IWorkspaceContextService,
+		@IAgentHostService private readonly _agentHostService: IAgentHostService,
 	) {
 		super(fileService, pathService, logService, workspaceContextService);
 		this._installedPlugins = this._register(new CopilotCliInstalledPluginsStore(
@@ -1080,10 +1149,20 @@ export class CopilotCliAgentPluginDiscovery extends AbstractAgentPluginDiscovery
 				if (!stat.isDirectory) {
 					continue;
 				}
+				const canUninstall = !!installedPlugin.marketplace || !!installedPlugin.directSourceId;
 				sources.push({
 					uri: stat.resource,
 					fromMarketplace: undefined,
 					watchPluginContents: false,
+					remove: this._agentHostService.uninstallPlugin && canUninstall ? async () => {
+						await this._agentHostService.uninstallPlugin!(COPILOT_CLI_AGENT_PROVIDER_ID, {
+							name: installedPlugin.name,
+							marketplace: installedPlugin.marketplace,
+							...(installedPlugin.directSourceId ? { directSourceId: installedPlugin.directSourceId } : {}),
+						});
+						this._enablementModel.remove(stat.resource.toString());
+						return true;
+					} : undefined,
 				});
 			} catch {
 				continue;

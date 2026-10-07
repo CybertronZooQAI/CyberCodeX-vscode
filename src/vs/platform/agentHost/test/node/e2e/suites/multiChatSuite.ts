@@ -131,7 +131,6 @@ export function defineMultiChatTests(context: IAgentHostE2ETestContext): void {
 	}
 
 	function peerFileOperationTest(title: string, run: Mocha.AsyncFunc): void {
-		// Skip unstable Codex packaged-Linux shell replay while retaining recording and unaffected platforms.
 		providerTest(title, run, config.fileOperationStrategy === 'fileTools' || context.portableShellToolReplayEnabled);
 	}
 
@@ -313,7 +312,7 @@ export function defineMultiChatTests(context: IAgentHostE2ETestContext): void {
 		assert.deepStrictEqual({ turns: state.turns, activeTurn: state.activeTurn, status: state.status }, {
 			turns: [],
 			activeTurn: undefined,
-			status: SessionStatus.Idle,
+			status: SessionStatus.Idle | SessionStatus.IsRead,
 		});
 	}, config.supportsMultipleChats);
 
@@ -356,14 +355,23 @@ export function defineMultiChatTests(context: IAgentHostE2ETestContext): void {
 		assert.ok(!peers.includes(first) && peers.includes(second));
 	}, config.supportsMultipleChats);
 
-	conformanceTest(context, 'recreating a disposed peer chat starts empty', async function () {
-		const { sessionUri } = await createSession('recreate');
-		const peer = await createPeer(sessionUri, 'peer');
+	conformanceTest(context, 'a replacement peer chat starts empty after disposing a populated peer', async function () {
+		const { sessionUri, defaultChatUri } = await createSession('replace');
+		const peer = await createCompletedPeer(sessionUri, 'peer', 'Original Peer');
+		const originalTurnCount = (await chatState(peer)).turns.length;
 		await context.client.call('disposeChat', { channel: peer }, 30_000);
 
-		await createPeer(sessionUri, 'peer');
+		const replacement = await createPeer(sessionUri, 'replacement');
 
-		assert.deepStrictEqual((await chatState(peer)).turns, []);
+		assert.deepStrictEqual({
+			originalTurnCount,
+			chats: (await sessionState(sessionUri)).chats.map(chat => chat.resource),
+			turns: (await chatState(replacement)).turns,
+		}, {
+			originalTurnCount: 1,
+			chats: [defaultChatUri, replacement],
+			turns: [],
+		});
 	}, config.supportsMultipleChats);
 
 	conformanceTest(context, 'renaming a peer chat updates its catalog title', async function () {
@@ -759,7 +767,7 @@ export function defineMultiChatTests(context: IAgentHostE2ETestContext): void {
 		assert.strictEqual(readFileSync(file, 'utf8').trim(), 'AFTER_PEER');
 	});
 
-	// Directory creation always uses shell, so apply the Codex packaged-Linux replay gate directly.
+	// Directory creation always uses the shell, even for providers with native file tools.
 	providerTest('peer chat creates a file in a nested directory', async function () {
 		const { sessionUri, workspace } = await createSession('nested-create');
 		const file = join(workspace, 'peer-output', 'report.txt');

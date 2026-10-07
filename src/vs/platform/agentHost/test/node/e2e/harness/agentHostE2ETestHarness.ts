@@ -13,7 +13,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathS
 import { homedir, tmpdir, userInfo } from 'os';
 import { fileURLToPath } from 'url';
 import { timeout } from '../../../../../../base/common/async.js';
-import { join } from '../../../../../../base/common/path.js';
+import { basename, join } from '../../../../../../base/common/path.js';
 import { removeAnsiEscapeCodes } from '../../../../../../base/common/strings.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import {
@@ -29,17 +29,19 @@ import {
 	type ChatInputRequestedAction, type ChatToolCallReadyAction,
 	type ChatErrorAction, type ChatToolCallCompleteAction, type ChatToolCallStartAction,
 } from '../../../../common/state/sessionActions.js';
+import type { AhpNotification } from '../../../../common/state/sessionProtocol.js';
 import { CopilotCliConfigKey } from '../../../../common/copilotCliConfig.js';
 import type { SessionMode } from '../../../../common/agentHostSchema.js';
 import { AgentHostSessionResidencyLimitEnvVar } from '../../../../common/agentService.js';
-import { CapiReplayMode, type ICapiReplayResponse } from './capiReplayProxy.js';
+import { CapiReplayMode, type ICapiReplayResponse, type IReplayVerificationOptions } from './capiReplayProxy.js';
 import {
 	fetchSessionWithChat, getActionEnvelope, getAgentHostE2ETestTimeout, isActionNotification, IServerHandle, killServer, stopServer, TestProtocolClient,
 } from '../../serverIntegrationTestHelpers.js';
 import { defaultAgentHostTarget, type IAgentHostTarget } from './agentHostTarget.js';
 import { createProviderSession, dispatchTurn, dispatchTurnWithAttachments } from '../../providerIntegrationTestHelpers.js';
-import { AgentHostUpdateSnapshotsEnvVar, AhpSnapshotScenario, type IAhpSnapshotOptions } from './ahpSnapshot.js';
+import { AgentHostUpdateSnapshotsEnvVar, AhpSnapshotScenario, waitForChatUnreadAfterTurn, type IAhpSnapshotOptions } from './ahpSnapshot.js';
 import { normalizeShellToolNameForCapture } from './shellToolNames.js';
+import { preserveAgentHostE2ELogs } from './agentHostE2EDiagnostics.js';
 
 // #region Record/replay
 
@@ -144,7 +146,7 @@ export async function removeTempDirs(tempDirs: string[]): Promise<void> {
 		if (Date.now() >= deadline) {
 			throw new AggregateError(
 				Array.from(errors.values()),
-				`Failed to remove Agent Host E2E temporary directories: ${pendingDirs.join(', ')}`,
+				`Failed to remove Agent Host E2E temporary directories: ${Array.from(errors, ([dir, error]) => `${dir}: ${error.message}`).join('; ')}`,
 			);
 		}
 		await timeout(500);
@@ -395,15 +397,6 @@ export interface IAgentHostE2EProviderConfig {
 	readonly fileDeleteReplayUnstableOnWindows?: boolean;
 	/** Provider's file-create shell turn can report success during Windows replay without writing the file. */
 	readonly fileCreateReplayUnstableOnWindows?: boolean;
-	/**
-	 * When set, the subagent-reopen ("replay path") test is skipped on Windows for
-	 * this provider, which rebuilds the reopened transcript from the bundled SDK's
-	 * on-disk `subagents/agent-*.jsonl` files — not reliably visible on Windows
-	 * right after the turn, so the transcript can come back empty. macOS/Linux keep
-	 * full coverage; providers that rebuild from the in-process event log (Copilot)
-	 * are unaffected and stay enabled on Windows.
-	 */
-	readonly subagentReplayUnstableOnWindows?: boolean;
 	/** Provider-specific observable used to exercise entering and leaving plan mode. */
 	readonly planModeStyle?: 'session-state' | 'input-request';
 	/** Whether the provider supports additional peer chats and chat forks. */
@@ -549,8 +542,12 @@ export interface IDrivenTurnResult {
 	responseText: string;
 }
 
-export async function driveTurnToCompletion(c: TestProtocolClient, session: string, turnId: string, text: string, clientSeq: number): Promise<IDrivenTurnResult> {
-	return driveTurn(c, buildDefaultChatUri(session), turnId, clientSeq, () => dispatchTurn(c, session, turnId, text, clientSeq));
+export interface IDriveTurnOptions {
+	expectUnread?: boolean;
+}
+
+export async function driveTurnToCompletion(c: TestProtocolClient, session: string, turnId: string, text: string, clientSeq: number, options?: IDriveTurnOptions): Promise<IDrivenTurnResult> {
+	return driveTurn(c, buildDefaultChatUri(session), turnId, clientSeq, () => dispatchTurn(c, session, turnId, text, clientSeq), ChatInputResponseKind.Accept, getAcceptedAnswers, options);
 }
 
 export async function driveChatTurnToCompletion(c: TestProtocolClient, chat: string, turnId: string, text: string, clientSeq: number): Promise<IDrivenTurnResult> {
@@ -591,7 +588,7 @@ export async function driveTurnWithAnswersToCompletion(c: TestProtocolClient, se
 	return driveTurn(c, buildDefaultChatUri(session), turnId, clientSeq, () => dispatchTurn(c, session, turnId, text, clientSeq), ChatInputResponseKind.Accept, getAnswers);
 }
 
-async function driveTurn(c: TestProtocolClient, chat: string, turnId: string, clientSeq: number, dispatch: () => void, inputResponse = ChatInputResponseKind.Accept, answerProvider = getAcceptedAnswers): Promise<IDrivenTurnResult> {
+async function driveTurn(c: TestProtocolClient, chat: string, turnId: string, clientSeq: number, dispatch: () => void, inputResponse = ChatInputResponseKind.Accept, answerProvider = getAcceptedAnswers, options?: IDriveTurnOptions): Promise<IDrivenTurnResult> {
 	c.clearReceived();
 	dispatch();
 
@@ -599,6 +596,7 @@ async function driveTurn(c: TestProtocolClient, chat: string, turnId: string, cl
 	let nextClientSeq = clientSeq + 1;
 	let sawInputRequest = false;
 	let sawPendingConfirmation = false;
+	let terminalNotification!: AhpNotification;
 
 	while (true) {
 		const notification = await c.waitForNotification(n => {
@@ -662,7 +660,12 @@ async function driveTurn(c: TestProtocolClient, chat: string, turnId: string, cl
 
 		const action = getActionEnvelope(notification).action as { turnId: string };
 		assert.strictEqual(action.turnId, turnId);
+		terminalNotification = notification;
 		break;
+	}
+
+	if (options?.expectUnread !== false) {
+		await waitForChatUnreadAfterTurn(c, chat, getActionEnvelope(terminalNotification).serverSeq);
 	}
 
 	return { sawInputRequest, sawPendingConfirmation, responseText: getMarkdownResponseText(c) };
@@ -886,7 +889,8 @@ export class AgentHostE2EServerLease {
 	private _server: IServerHandle | undefined;
 	private _client: TestProtocolClient | undefined;
 	private readonly _shared: boolean;
-	private _dataDir: string | undefined;
+	private readonly _dataDirs: string[] = [];
+	private _needsFreshDataDirectory = false;
 	/**
 	 * Number of **model-backed** tests served by the current shared server. A
 	 * single long-lived host caches one provider SDK/CLI subprocess and reuses it
@@ -900,25 +904,25 @@ export class AgentHostE2EServerLease {
 	private _testsOnCurrentServer = 0;
 	private _cleanupClientSeq = 1_000_000;
 	private _currentCapiReplay: ReturnType<typeof capiReplayFor> | undefined;
-	private readonly _startOptions: { readonly claudeSdkRoot?: string; readonly codexSdkRoot?: string; readonly codexHomeDir: string; readonly homeDir: string; readonly userDataDir: string; readonly env: Readonly<Record<string, string>> };
+	private _startOptions: { readonly claudeSdkRoot?: string; readonly codexSdkRoot?: string; readonly codexHomeDir: string; readonly homeDir: string; readonly userDataDir: string; readonly env: Readonly<Record<string, string>> };
 	private readonly _target: IAgentHostTarget;
 
 	constructor(
 		private readonly _config: IAgentHostE2EProviderConfig,
-		startOptions: { readonly claudeSdkRoot?: string; readonly codexSdkRoot?: string; readonly target?: IAgentHostTarget } = {},
+		startOptions: { readonly claudeSdkRoot?: string; readonly codexSdkRoot?: string; readonly target?: IAgentHostTarget; readonly env?: Readonly<Record<string, string>> } = {},
 	) {
-		const dataDir = mkdtempSync(join(tmpdir(), 'vscode-agent-host-e2e-'));
-		const codexHomeDir = join(dataDir, '.codex');
-		mkdirSync(codexHomeDir);
-		this._dataDir = dataDir;
 		this._target = startOptions.target ?? defaultAgentHostTarget;
 		this._startOptions = {
 			claudeSdkRoot: startOptions.claudeSdkRoot,
 			codexSdkRoot: startOptions.codexSdkRoot,
-			codexHomeDir,
-			homeDir: dataDir,
-			userDataDir: join(dataDir, 'user-data'),
-			env: { [AgentHostSessionResidencyLimitEnvVar]: '0' },
+			...this._createDataDirectories(),
+			env: {
+				[AgentHostSessionResidencyLimitEnvVar]: '0',
+				// Keep replay deterministic when tests run inside a Copilot app process
+				// that has local experimental CLI tools enabled.
+				COPILOT_CLI_ENABLED_FEATURE_FLAGS: '',
+				...startOptions.env,
+			},
 		};
 		// Server reuse is a replay-only optimization: recording writes one fixture
 		// per proxy and so needs a fresh proxy (hence a fresh server) per test.
@@ -927,8 +931,20 @@ export class AgentHostE2EServerLease {
 		this._shared = !RECORD;
 	}
 
+	private _createDataDirectories() {
+		const homeDir = mkdtempSync(join(tmpdir(), 'vscode-agent-host-e2e-'));
+		this._dataDirs.push(homeDir);
+		const codexHomeDir = join(homeDir, '.codex');
+		mkdirSync(codexHomeDir);
+		return { homeDir, userDataDir: join(homeDir, 'user-data'), codexHomeDir };
+	}
+
 	/** Acquire a server + connected client for a test, returning both. */
 	async acquire(testTitle: string, modelTraffic: AgentHostE2EModelTraffic = 'recorded'): Promise<{ server: IServerHandle; client: TestProtocolClient }> {
+		if (this._needsFreshDataDirectory) {
+			this._startOptions = { ...this._startOptions, ...this._createDataDirectories() };
+			this._needsFreshDataDirectory = false;
+		}
 		const capiReplay = capiReplayFor(this._config.provider, testTitle, modelTraffic);
 		this._currentCapiReplay = capiReplay;
 		// Bound both provider-model load and host-owned resource accumulation.
@@ -988,6 +1004,8 @@ export class AgentHostE2EServerLease {
 		if (!server || !proxy || !capiReplay) {
 			throw new Error('[agent-host-e2e] no replay-backed server to restart');
 		}
+		// Provider discovery after a restart must not leak persisted conversations into the next test.
+		this._needsFreshDataDirectory = true;
 
 		if (crash) {
 			await killServer(server);
@@ -1056,6 +1074,7 @@ export class AgentHostE2EServerLease {
 			this._modelBackedTestsOnCurrentServer = 0;
 			this._testsOnCurrentServer = 0;
 		}
+		this._startOptions = { ...this._startOptions, ...this._createDataDirectories() };
 	}
 
 	get observedModelRequestBodies(): readonly string[] {
@@ -1072,6 +1091,12 @@ export class AgentHostE2EServerLease {
 	 * output. Best-effort: never throws because it runs during failed-test teardown.
 	 */
 	dumpRuntimeLogsOnFailure(label: string): void {
+		const destination = join(process.cwd(), '.build', 'logs', 'integration-tests', `agent-host-e2e-${process.pid}-${basename(this._startOptions.homeDir)}`);
+		try {
+			preserveAgentHostE2ELogs(this._startOptions.userDataDir, this._startOptions.homeDir, destination, label);
+		} catch (error) {
+			process.stdout.write(`[agent-host-e2e] Failed to preserve logs for "${label}": ${error}\n`);
+		}
 		this._dumpAgentHostLogOnFailure(label);
 		if (!this._isCopilotProvider) {
 			return;
@@ -1144,21 +1169,19 @@ export class AgentHostE2EServerLease {
 	}
 
 	/**
-	 * Release a test: dispose its sessions, disconnect the client, and verify the
-	 * replay traffic. A shared server is normally kept alive (with its cached SDK
-	 * client) for the next test; a per-test server is stopped.
-	 *
-	 * Pass `forceRestart` when the just-run test failed. A failed test can leave
-	 * a mid-turn session that wedges (or has already killed) the shared host, so
-	 * reusing it would cascade `ECONNREFUSED` / `createSession` timeouts into the
-	 * next, unrelated test. Restarting isolates the failure to the one test that
-	 * caused it. The strict cache-miss assertion is also skipped on restart: the
-	 * test already failed for its own reason, and a secondary cache-miss throw
-	 * would only obscure it.
+	 * Dispose the test's sessions and verify replay, reusing a healthy shared server.
+	 * Pass `forceRestart` after a failed test to isolate the next test without obscuring the original failure.
 	 */
-	async release(createdSessions: string[], forceRestart = false): Promise<void> {
+	async release(createdSessions: string[], forceRestart = false, verification?: IReplayVerificationOptions): Promise<void> {
 		const client = this._client;
 		const cleanupErrors: Error[] = [];
+		const recordCleanupError = (error: unknown) => {
+			const cleanupError = error instanceof Error ? error : new Error(String(error));
+			cleanupErrors.push(cleanupError);
+			if (cleanupErrors.length === 1) {
+				this.dumpRuntimeLogsOnFailure(`resource cleanup: ${cleanupError.message}`);
+			}
+		};
 		if (client) {
 			// A session left unrestored after a host restart is restored on subscribe.
 			const restoreTimeout = getAgentHostE2ETestTimeout(10_000, 30_000);
@@ -1190,7 +1213,7 @@ export class AgentHostE2EServerLease {
 					}
 					await client.call('disposeSession', { channel: session }, disposeTimeout);
 				} catch (error) {
-					cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+					recordCleanupError(error);
 				}
 			}
 			client.close();
@@ -1198,23 +1221,23 @@ export class AgentHostE2EServerLease {
 		createdSessions.length = 0;
 		this._client = undefined;
 
-		const mustRestart = forceRestart || cleanupErrors.length > 0;
+		const mustRestart = forceRestart || cleanupErrors.length > 0 || this._needsFreshDataDirectory;
 		if (this._shared && !mustRestart) {
 			// Surface this test's strict replay failures but keep the server (and
 			// its cached SDK client) alive for the next test.
 			try {
-				this._server?.capiReplay?.assertNoReplayMismatches();
+				this._server?.capiReplay?.assertNoReplayMismatches(verification);
 			} catch (error) {
-				cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+				recordCleanupError(error);
 				try {
 					await this._server?.capiReplay?.close();
 				} catch (stopError) {
-					cleanupErrors.push(stopError instanceof Error ? stopError : new Error(String(stopError)));
+					recordCleanupError(stopError);
 				}
 				try {
 					await stopServer(this._server);
 				} catch (stopError) {
-					cleanupErrors.push(stopError instanceof Error ? stopError : new Error(String(stopError)));
+					recordCleanupError(stopError);
 				}
 				this._server = undefined;
 				this._modelBackedTestsOnCurrentServer = 0;
@@ -1229,20 +1252,24 @@ export class AgentHostE2EServerLease {
 				if (forceRestart) {
 					await this._server?.capiReplay?.close();
 				} else {
-					await this._server?.capiReplay?.stop();
+					await this._server?.capiReplay?.stop(verification);
 				}
 			} catch (error) {
-				cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+				recordCleanupError(error);
 			} finally {
 				try {
 					await stopServer(this._server);
 				} catch (error) {
-					cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+					recordCleanupError(error);
 				}
 				this._server = undefined;
 				this._modelBackedTestsOnCurrentServer = 0;
 				this._testsOnCurrentServer = 0;
 			}
+		}
+		if (forceRestart || cleanupErrors.length > 0) {
+			this._needsFreshDataDirectory = true;
+			this.dumpRuntimeLogsOnFailure('resource cleanup after shutdown');
 		}
 		if (cleanupErrors.length > 0) {
 			if (forceRestart) {
@@ -1256,10 +1283,8 @@ export class AgentHostE2EServerLease {
 		}
 	}
 
-	/** Tear down a shared server at the end of the suite (no-op for per-test). */
+	/** Stop the server and remove all isolated homes, including those retired after failures. */
 	async dispose(): Promise<void> {
-		const dataDir = this._dataDir;
-		this._dataDir = undefined;
 		try {
 			if (this._server) {
 				try {
@@ -1269,10 +1294,11 @@ export class AgentHostE2EServerLease {
 					this._server = undefined;
 				}
 			}
+		} catch (error) {
+			this.dumpRuntimeLogsOnFailure(`suite cleanup: ${error instanceof Error ? error.message : String(error)}`);
+			throw error;
 		} finally {
-			if (dataDir) {
-				await removeTempDirs([dataDir]);
-			}
+			await removeTempDirs(this._dataDirs);
 		}
 	}
 }
